@@ -1,0 +1,1153 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace MiniTransformerAI
+{
+// ─────────────────────────────────────────────────────────────────────────
+//  MATH UTILITIES
+// ─────────────────────────────────────────────────────────────────────────
+static class MathF2
+{
+public static float Sqrt(float x) => (float)Math.Sqrt(x);
+public static float Exp(float x) => (float)Math.Exp(x);
+public static float Log(float x) => (float)Math.Log(x);
+public static float Tanh(float x) => (float)Math.Tanh(x);
+public static float Max(float a, float b) => a > b ? a : b;
+}
+
+```
+// ─────────────────────────────────────────────────────────────────────────
+//  TENSOR  (simple 1-D and 2-D float arrays with helpers)
+// ─────────────────────────────────────────────────────────────────────────
+class Tensor
+{
+    public float[] Data;
+    public int Rows, Cols;
+    public Tensor(int rows, int cols) { Rows = rows; Cols = cols; Data = new float[rows * cols]; }
+    public float this[int r, int c] { get => Data[r * Cols + c]; set => Data[r * Cols + c] = value; }
+
+    public static Tensor Zeros(int r, int c) => new Tensor(r, c);
+
+    public Tensor Clone()
+    {
+        var t = new Tensor(Rows, Cols);
+        Array.Copy(Data, t.Data, Data.Length);
+        return t;
+    }
+
+    // Matrix multiply: (M x K) @ (K x N) = (M x N)
+    public static Tensor MatMul(Tensor a, Tensor b)
+    {
+        if (a.Cols != b.Rows) throw new Exception($"MatMul dim mismatch {a.Rows}x{a.Cols} @ {b.Rows}x{b.Cols}");
+        var c = new Tensor(a.Rows, b.Cols);
+        int M = a.Rows, K = a.Cols, N = b.Cols;
+        Parallel.For(0, M, i =>
+        {
+            for (int j = 0; j < N; j++)
+            {
+                float s = 0f;
+                for (int k = 0; k < K; k++) s += a[i, k] * b[k, j];
+                c[i, j] = s;
+            }
+        });
+        return c;
+    }
+
+    // Transpose
+    public Tensor T()
+    {
+        var t = new Tensor(Cols, Rows);
+        for (int i = 0; i < Rows; i++)
+            for (int j = 0; j < Cols; j++)
+                t[j, i] = this[i, j];
+        return t;
+    }
+
+    public static Tensor operator +(Tensor a, Tensor b)
+    {
+        var c = new Tensor(a.Rows, a.Cols);
+        for (int i = 0; i < a.Data.Length; i++) c.Data[i] = a.Data[i] + b.Data[i];
+        return c;
+    }
+    public static Tensor operator *(Tensor a, float s)
+    {
+        var c = new Tensor(a.Rows, a.Cols);
+        for (int i = 0; i < a.Data.Length; i++) c.Data[i] = a.Data[i] * s;
+        return c;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  RANDOM WEIGHT INIT
+// ─────────────────────────────────────────────────────────────────────────
+static class WeightInit
+{
+    static Random _rng = new Random(42);
+    public static void Xavier(Tensor t, int fanIn, int fanOut)
+    {
+        float limit = MathF2.Sqrt(6f / (fanIn + fanOut));
+        for (int i = 0; i < t.Data.Length; i++)
+            t.Data[i] = (float)(_rng.NextDouble() * 2 * limit - limit);
+    }
+    public static void Normal(Tensor t, float std = 0.02f)
+    {
+        for (int i = 0; i < t.Data.Length; i++)
+        {
+            double u1 = 1.0 - _rng.NextDouble();
+            double u2 = 1.0 - _rng.NextDouble();
+            double z = Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2 * Math.PI * u2);
+            t.Data[i] = (float)(z * std);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  BYTE-PAIR TOKENIZER  (character-level fallback built-in)
+// ─────────────────────────────────────────────────────────────────────────
+class Tokenizer
+{
+    public Dictionary<string, int> Vocab = new Dictionary<string, int>();
+    public string[] IdToToken;
+    public int VocabSize => Vocab.Count;
+    public int PadId = 0, BosId = 1, EosId = 2, UnkId = 3;
+
+    public Tokenizer()
+    {
+        AddToken("<PAD>");
+        AddToken("<BOS>");
+        AddToken("<EOS>");
+        AddToken("<UNK>");
+    }
+
+    void AddToken(string t) { if (!Vocab.ContainsKey(t)) Vocab[t] = Vocab.Count; }
+
+    public void BuildFromCorpus(string text)
+    {
+        // Character-level vocab
+        foreach (char c in text.Distinct().OrderBy(x => x))
+            AddToken(c.ToString());
+        // Common bigrams
+        for (int i = 0; i < text.Length - 1; i++)
+        {
+            string bi = text.Substring(i, 2);
+            AddToken(bi);
+        }
+        RebuildIdToToken();
+    }
+
+    public void RebuildIdToToken()
+    {
+        IdToToken = new string[Vocab.Count];
+        foreach (var kv in Vocab) IdToToken[kv.Value] = kv.Key;
+    }
+
+    public List<int> Encode(string text)
+    {
+        var ids = new List<int> { BosId };
+        int i = 0;
+        while (i < text.Length)
+        {
+            // Try bigram first
+            if (i + 1 < text.Length && Vocab.TryGetValue(text.Substring(i, 2), out int bid))
+            { ids.Add(bid); i += 2; }
+            else if (Vocab.TryGetValue(text[i].ToString(), out int cid))
+            { ids.Add(cid); i++; }
+            else { ids.Add(UnkId); i++; }
+        }
+        ids.Add(EosId);
+        return ids;
+    }
+
+    public string Decode(List<int> ids)
+    {
+        var sb = new StringBuilder();
+        foreach (int id in ids)
+        {
+            if (id == BosId || id == EosId || id == PadId) continue;
+            if (IdToToken != null && id < IdToToken.Length)
+                sb.Append(IdToToken[id]);
+        }
+        return sb.ToString();
+    }
+
+    public void Save(string path)
+    {
+        File.WriteAllText(path, JsonSerializer.Serialize(Vocab));
+    }
+
+    public void Load(string path)
+    {
+        Vocab = JsonSerializer.Deserialize<Dictionary<string, int>>(File.ReadAllText(path))!;
+        RebuildIdToToken();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  LAYER NORM
+// ─────────────────────────────────────────────────────────────────────────
+class LayerNorm
+{
+    public float[] Gamma, Beta;
+    public float[] DGamma, DBeta;
+    int _dim;
+    // Cache for backward
+    float[] _xNorm, _std;
+    float[][] _xCache;
+
+    public LayerNorm(int dim)
+    {
+        _dim = dim;
+        Gamma = new float[dim]; for (int i = 0; i < dim; i++) Gamma[i] = 1f;
+        Beta = new float[dim];
+        DGamma = new float[dim];
+        DBeta = new float[dim];
+    }
+
+    public Tensor Forward(Tensor x)
+    {
+        int seq = x.Rows;
+        var y = new Tensor(seq, _dim);
+        _xNorm = new float[seq * _dim];
+        _std = new float[seq];
+        _xCache = new float[seq][];
+
+        for (int i = 0; i < seq; i++)
+        {
+            float mean = 0f;
+            for (int j = 0; j < _dim; j++) mean += x[i, j];
+            mean /= _dim;
+            float var = 0f;
+            for (int j = 0; j < _dim; j++) var += (x[i, j] - mean) * (x[i, j] - mean);
+            var /= _dim;
+            float std = MathF2.Sqrt(var + 1e-5f);
+            _std[i] = std;
+            for (int j = 0; j < _dim; j++)
+            {
+                float xn = (x[i, j] - mean) / std;
+                _xNorm[i * _dim + j] = xn;
+                y[i, j] = Gamma[j] * xn + Beta[j];
+            }
+        }
+        return y;
+    }
+
+    public Tensor Backward(Tensor dY)
+    {
+        int seq = dY.Rows;
+        var dX = new Tensor(seq, _dim);
+        for (int i = 0; i < _dim; i++) { DGamma[i] = 0f; DBeta[i] = 0f; }
+
+        for (int i = 0; i < seq; i++)
+        {
+            float std = _std[i];
+            float dvar = 0f, dmean = 0f;
+
+            for (int j = 0; j < _dim; j++)
+            {
+                DGamma[j] += dY[i, j] * _xNorm[i * _dim + j];
+                DBeta[j] += dY[i, j];
+            }
+
+            float[] dxhat = new float[_dim];
+            for (int j = 0; j < _dim; j++) dxhat[j] = dY[i, j] * Gamma[j];
+            for (int j = 0; j < _dim; j++) dvar += dxhat[j] * _xNorm[i * _dim + j] * -0.5f / (std * std);
+            for (int j = 0; j < _dim; j++) dmean += -dxhat[j] / std;
+
+            for (int j = 0; j < _dim; j++)
+                dX[i, j] = dxhat[j] / std + dvar * 2f * _xNorm[i * _dim + j] / _dim + dmean / _dim;
+        }
+        return dX;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  LINEAR LAYER
+// ─────────────────────────────────────────────────────────────────────────
+class Linear
+{
+    public Tensor W, B;
+    public Tensor DW, DB;
+    Tensor _xCache;
+    public int InDim, OutDim;
+
+    public Linear(int inDim, int outDim, bool bias = true)
+    {
+        InDim = inDim; OutDim = outDim;
+        W = new Tensor(inDim, outDim);
+        B = new Tensor(1, outDim);
+        DW = new Tensor(inDim, outDim);
+        DB = new Tensor(1, outDim);
+        WeightInit.Normal(W, MathF2.Sqrt(2f / inDim));
+    }
+
+    public Tensor Forward(Tensor x)
+    {
+        _xCache = x;
+        var y = Tensor.MatMul(x, W);
+        for (int i = 0; i < y.Rows; i++)
+            for (int j = 0; j < y.Cols; j++)
+                y[i, j] += B[0, j];
+        return y;
+    }
+
+    public Tensor Backward(Tensor dY)
+    {
+        // DW = X^T @ dY
+        var xT = _xCache.T();
+        var newDW = Tensor.MatMul(xT, dY);
+        for (int i = 0; i < DW.Data.Length; i++) DW.Data[i] += newDW.Data[i];
+        for (int j = 0; j < OutDim; j++)
+        {
+            float s = 0f;
+            for (int i = 0; i < dY.Rows; i++) s += dY[i, j];
+            DB.Data[j] += s;
+        }
+        var wT = W.T();
+        return Tensor.MatMul(dY, wT);
+    }
+
+    public void ZeroGrad() { Array.Clear(DW.Data, 0, DW.Data.Length); Array.Clear(DB.Data, 0, DB.Data.Length); }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  MULTI-HEAD SELF-ATTENTION  (causal)
+// ─────────────────────────────────────────────────────────────────────────
+class MultiHeadAttention
+{
+    int _dModel, _nHeads, _dHead;
+    public Linear Wq, Wk, Wv, Wo;
+
+    // Cache
+    Tensor _q, _k, _v, _x;
+    float[][][] _attnWeights; // [head][seq][seq]
+
+    public MultiHeadAttention(int dModel, int nHeads)
+    {
+        _dModel = dModel; _nHeads = nHeads; _dHead = dModel / nHeads;
+        Wq = new Linear(dModel, dModel);
+        Wk = new Linear(dModel, dModel);
+        Wv = new Linear(dModel, dModel);
+        Wo = new Linear(dModel, dModel);
+    }
+
+    Tensor Softmax(float[][] logits, int seq)
+    {
+        // In-place softmax rows, returns seq x seq
+        var t = new Tensor(seq, seq);
+        for (int i = 0; i < seq; i++)
+        {
+            float max = float.NegativeInfinity;
+            for (int j = 0; j <= i; j++) max = MathF2.Max(max, logits[i][j]);
+            float sum = 0f;
+            for (int j = 0; j <= i; j++) { float e = MathF2.Exp(logits[i][j] - max); t[i, j] = e; sum += e; }
+            for (int j = 0; j <= i; j++) t[i, j] /= sum;
+            // future tokens masked to 0
+        }
+        return t;
+    }
+
+    public Tensor Forward(Tensor x)
+    {
+        _x = x;
+        int seq = x.Rows;
+        _q = Wq.Forward(x);
+        _k = Wk.Forward(x);
+        _v = Wv.Forward(x);
+
+        var ctx = new Tensor(seq, _dModel);
+        _attnWeights = new float[_nHeads][][];
+        float scale = 1f / MathF2.Sqrt(_dHead);
+
+        for (int h = 0; h < _nHeads; h++)
+        {
+            int off = h * _dHead;
+            // Compute attention scores
+            float[][] scores = new float[seq][];
+            for (int i = 0; i < seq; i++)
+            {
+                scores[i] = new float[seq];
+                for (int j = 0; j <= i; j++)
+                {
+                    float dot = 0f;
+                    for (int d = 0; d < _dHead; d++) dot += _q[i, off + d] * _k[j, off + d];
+                    scores[i][j] = dot * scale;
+                    // mask future
+                }
+                for (int j = i + 1; j < seq; j++) scores[i][j] = float.NegativeInfinity;
+            }
+            var attn = Softmax(scores, seq);
+            _attnWeights[h] = scores; // store softmax-ed (recompute later)
+
+            // Context: attn @ V
+            for (int i = 0; i < seq; i++)
+                for (int d = 0; d < _dHead; d++)
+                {
+                    float s = 0f;
+                    for (int j = 0; j <= i; j++) s += attn[i, j] * _v[j, off + d];
+                    ctx[i, off + d] = s;
+                }
+        }
+        return Wo.Forward(ctx);
+    }
+
+    public Tensor Backward(Tensor dOut)
+    {
+        int seq = _x.Rows;
+        var dCtx = Wo.Backward(dOut);
+        var dQ = new Tensor(seq, _dModel);
+        var dK = new Tensor(seq, _dModel);
+        var dV = new Tensor(seq, _dModel);
+        float scale = 1f / MathF2.Sqrt(_dHead);
+
+        for (int h = 0; h < _nHeads; h++)
+        {
+            int off = h * _dHead;
+            // Recompute softmax
+            float[][] scores = new float[seq][];
+            for (int i = 0; i < seq; i++)
+            {
+                scores[i] = new float[seq];
+                for (int j = 0; j <= i; j++)
+                {
+                    float dot = 0f;
+                    for (int d = 0; d < _dHead; d++) dot += _q[i, off + d] * _k[j, off + d];
+                    scores[i][j] = dot * scale;
+                }
+            }
+            var attn = Softmax(scores, seq);
+
+            // dV = attn^T @ dCtx
+            for (int j = 0; j < seq; j++)
+                for (int d = 0; d < _dHead; d++)
+                {
+                    float s = 0f;
+                    for (int i = j; i < seq; i++) s += attn[i, j] * dCtx[i, off + d];
+                    dV[j, off + d] += s;
+                }
+
+            // dAttn = dCtx @ V^T
+            var dAttn = new float[seq][];
+            for (int i = 0; i < seq; i++)
+            {
+                dAttn[i] = new float[seq];
+                for (int j = 0; j <= i; j++)
+                {
+                    float s = 0f;
+                    for (int d = 0; d < _dHead; d++) s += dCtx[i, off + d] * _v[j, off + d];
+                    dAttn[i][j] = s;
+                }
+            }
+
+            // Softmax backward
+            for (int i = 0; i < seq; i++)
+            {
+                float dot = 0f;
+                for (int j = 0; j <= i; j++) dot += dAttn[i][j] * attn[i, j];
+                for (int j = 0; j <= i; j++) dAttn[i][j] = (dAttn[i][j] - dot) * attn[i, j] * scale;
+            }
+
+            // dQ, dK
+            for (int i = 0; i < seq; i++)
+                for (int d = 0; d < _dHead; d++)
+                {
+                    float gq = 0f, gk = 0f;
+                    for (int j = 0; j <= i; j++) gq += dAttn[i][j] * _k[j, off + d];
+                    for (int j = i; j < seq; j++) gk += dAttn[j][i] * _q[j, off + d];
+                    dQ[i, off + d] += gq;
+                    dK[i, off + d] += gk;
+                }
+        }
+
+        var dx1 = Wq.Backward(dQ);
+        var dx2 = Wk.Backward(dK);
+        var dx3 = Wv.Backward(dV);
+        var dx = new Tensor(seq, _dModel);
+        for (int i = 0; i < dx.Data.Length; i++) dx.Data[i] = dx1.Data[i] + dx2.Data[i] + dx3.Data[i];
+        return dx;
+    }
+
+    public void ZeroGrad() { Wq.ZeroGrad(); Wk.ZeroGrad(); Wv.ZeroGrad(); Wo.ZeroGrad(); }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  FEED-FORWARD NETWORK  (Gated GELU)
+// ─────────────────────────────────────────────────────────────────────────
+class FFN
+{
+    public Linear W1, W2;
+    Tensor _xCache, _gelu;
+
+    public FFN(int dModel, int dFF)
+    {
+        W1 = new Linear(dModel, dFF);
+        W2 = new Linear(dFF, dModel);
+    }
+
+    static float Gelu(float x)
+    {
+        return 0.5f * x * (1f + MathF2.Tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
+    }
+    static float GeluGrad(float x)
+    {
+        float t = MathF2.Tanh(0.7978845608f * (x + 0.044715f * x * x * x));
+        float sech2 = 1f - t * t;
+        return 0.5f * (1f + t) + 0.5f * x * sech2 * 0.7978845608f * (1f + 3f * 0.044715f * x * x);
+    }
+
+    public Tensor Forward(Tensor x)
+    {
+        _xCache = x;
+        var h = W1.Forward(x);
+        _gelu = h.Clone();
+        for (int i = 0; i < h.Data.Length; i++) _gelu.Data[i] = Gelu(h.Data[i]);
+        return W2.Forward(_gelu);
+    }
+
+    public Tensor Backward(Tensor dOut)
+    {
+        var dGelu = W2.Backward(dOut);
+        // Gelu backward
+        var dh = new Tensor(dGelu.Rows, dGelu.Cols);
+        for (int i = 0; i < dh.Data.Length; i++)
+            dh.Data[i] = dGelu.Data[i] * GeluGrad(_gelu.Data[i]);  // approximate
+        return W1.Backward(dh);
+    }
+
+    public void ZeroGrad() { W1.ZeroGrad(); W2.ZeroGrad(); }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  TRANSFORMER BLOCK
+// ─────────────────────────────────────────────────────────────────────────
+class TransformerBlock
+{
+    public MultiHeadAttention Attn;
+    public FFN FFN;
+    public LayerNorm LN1, LN2;
+    Tensor _x, _attnIn, _ffnIn;
+
+    public TransformerBlock(int dModel, int nHeads, int dFF)
+    {
+        Attn = new MultiHeadAttention(dModel, nHeads);
+        FFN = new FFN(dModel, dFF);
+        LN1 = new LayerNorm(dModel);
+        LN2 = new LayerNorm(dModel);
+    }
+
+    public Tensor Forward(Tensor x)
+    {
+        _x = x;
+        // Pre-norm attention
+        _attnIn = LN1.Forward(x);
+        var attnOut = Attn.Forward(_attnIn);
+        var x2 = x + attnOut;  // residual
+        // Pre-norm FFN
+        _ffnIn = x2;
+        var ln2Out = LN2.Forward(x2);
+        var ffnOut = FFN.Forward(ln2Out);
+        return x2 + ffnOut;  // residual
+    }
+
+    public Tensor Backward(Tensor dOut)
+    {
+        // FFN path
+        var dFFN = FFN.Backward(LN2.Backward(dOut));
+        var dx2 = dOut + dFFN;
+        // Attn path
+        var dAttn = Attn.Backward(LN1.Backward(dx2));
+        return dx2 + dAttn;
+    }
+
+    public void ZeroGrad() { Attn.ZeroGrad(); FFN.ZeroGrad(); }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  POSITIONAL ENCODING
+// ─────────────────────────────────────────────────────────────────────────
+class PositionalEncoding
+{
+    float[,] _pe;
+    public PositionalEncoding(int maxSeq, int dModel)
+    {
+        _pe = new float[maxSeq, dModel];
+        for (int pos = 0; pos < maxSeq; pos++)
+            for (int i = 0; i < dModel; i += 2)
+            {
+                double div = Math.Pow(10000.0, (double)i / dModel);
+                _pe[pos, i] = (float)Math.Sin(pos / div);
+                if (i + 1 < dModel) _pe[pos, i + 1] = (float)Math.Cos(pos / div);
+            }
+    }
+
+    public Tensor Add(Tensor x)
+    {
+        var y = x.Clone();
+        for (int i = 0; i < x.Rows; i++)
+            for (int j = 0; j < x.Cols; j++)
+                y[i, j] += _pe[i, j];
+        return y;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  TRANSFORMER LANGUAGE MODEL
+// ─────────────────────────────────────────────────────────────────────────
+class TransformerLM
+{
+    public int DModel, NHeads, NLayers, DFF, VocabSize, MaxSeq;
+    Tensor _tokenEmb;      // VocabSize x DModel
+    Tensor _dTokenEmb;
+    Tensor _lmHead;        // DModel x VocabSize
+    Tensor _dLmHead;
+    PositionalEncoding _pe;
+    TransformerBlock[] _blocks;
+
+    // Forward cache
+    Tensor _embOut;
+    Tensor[] _blockOuts;
+
+    public TransformerLM(int vocabSize, int dModel = 128, int nHeads = 4, int nLayers = 4, int dFF = 512, int maxSeq = 256)
+    {
+        VocabSize = vocabSize; DModel = dModel; NHeads = nHeads; NLayers = nLayers; DFF = dFF; MaxSeq = maxSeq;
+        _tokenEmb = new Tensor(vocabSize, dModel);
+        _dTokenEmb = new Tensor(vocabSize, dModel);
+        _lmHead = new Tensor(dModel, vocabSize);
+        _dLmHead = new Tensor(dModel, vocabSize);
+        WeightInit.Normal(_tokenEmb, 0.02f);
+        WeightInit.Normal(_lmHead, 0.02f);
+        _pe = new PositionalEncoding(maxSeq, dModel);
+        _blocks = new TransformerBlock[nLayers];
+        for (int i = 0; i < nLayers; i++) _blocks[i] = new TransformerBlock(dModel, nHeads, dFF);
+        _blockOuts = new Tensor[nLayers];
+    }
+
+    public Tensor Forward(int[] tokenIds)
+    {
+        int seq = tokenIds.Length;
+        // Embedding lookup
+        var emb = new Tensor(seq, DModel);
+        for (int i = 0; i < seq; i++)
+            for (int d = 0; d < DModel; d++)
+                emb[i, d] = _tokenEmb[tokenIds[i], d];
+        _embOut = _pe.Add(emb);
+        var x = _embOut;
+        for (int l = 0; l < NLayers; l++) { x = _blocks[l].Forward(x); _blockOuts[l] = x; }
+        // LM head: (seq x DModel) @ (DModel x V) = (seq x V)
+        return Tensor.MatMul(x, _lmHead);
+    }
+
+    // Returns cross-entropy loss and also backpropagates
+    public float TrainStep(int[] input, int[] target, AdamOptimizer adam)
+    {
+        ZeroGrad();
+        int seq = input.Length;
+        var logits = Forward(input);  // seq x V
+
+        // Softmax + cross-entropy
+        float loss = 0f;
+        var dLogits = new Tensor(seq, VocabSize);
+        for (int i = 0; i < seq; i++)
+        {
+            float max = float.NegativeInfinity;
+            for (int j = 0; j < VocabSize; j++) max = MathF2.Max(max, logits[i, j]);
+            float sum = 0f;
+            float[] probs = new float[VocabSize];
+            for (int j = 0; j < VocabSize; j++) { probs[j] = MathF2.Exp(logits[i, j] - max); sum += probs[j]; }
+            for (int j = 0; j < VocabSize; j++) probs[j] /= sum;
+            loss += -MathF2.Log(probs[target[i]] + 1e-8f);
+            for (int j = 0; j < VocabSize; j++) dLogits[i, j] = probs[j];
+            dLogits[i, target[i]] -= 1f;
+        }
+        loss /= seq;
+        for (int i = 0; i < dLogits.Data.Length; i++) dLogits.Data[i] /= seq;
+
+        // Backward through LM head
+        var xLast = _blockOuts[NLayers - 1];
+        var dX = Tensor.MatMul(dLogits, _lmHead.T());
+        var newDLmHead = Tensor.MatMul(xLast.T(), dLogits);
+        for (int i = 0; i < _dLmHead.Data.Length; i++) _dLmHead.Data[i] += newDLmHead.Data[i];
+
+        // Backward through blocks
+        for (int l = NLayers - 1; l >= 0; l--) dX = _blocks[l].Backward(dX);
+
+        // Backward through embeddings
+        for (int i = 0; i < seq; i++)
+            for (int d = 0; d < DModel; d++)
+                _dTokenEmb[input[i], d] += dX[i, d];
+
+        adam.Step(this);
+        return loss;
+    }
+
+    public void ZeroGrad()
+    {
+        Array.Clear(_dTokenEmb.Data, 0, _dTokenEmb.Data.Length);
+        Array.Clear(_dLmHead.Data, 0, _dLmHead.Data.Length);
+        for (int l = 0; l < NLayers; l++) _blocks[l].ZeroGrad();
+    }
+
+    // Generate text
+    public string Generate(Tokenizer tok, string prompt, int maxNew = 200, float temp = 0.8f, int topK = 40)
+    {
+        var ids = tok.Encode(prompt);
+        var rng = new Random();
+        for (int step = 0; step < maxNew; step++)
+        {
+            int[] inp = ids.TakeLast(MaxSeq).ToArray();
+            var logits = Forward(inp);
+            // Get last token logits
+            float[] lastLogits = new float[VocabSize];
+            for (int j = 0; j < VocabSize; j++) lastLogits[j] = logits[inp.Length - 1, j] / temp;
+            // TopK sampling
+            var topKIdx = lastLogits.Select((v, i) => (v, i)).OrderByDescending(x => x.v).Take(topK).ToArray();
+            float max = topKIdx[0].v;
+            float sum = 0f;
+            float[] probs = new float[topK];
+            for (int i = 0; i < topK; i++) { probs[i] = MathF2.Exp(topKIdx[i].v - max); sum += probs[i]; }
+            for (int i = 0; i < topK; i++) probs[i] /= sum;
+            double r = rng.NextDouble();
+            double cumul = 0;
+            int chosen = topKIdx[topK - 1].i;
+            for (int i = 0; i < topK; i++) { cumul += probs[i]; if (r < cumul) { chosen = topKIdx[i].i; break; } }
+            if (chosen == tok.EosId) break;
+            ids.Add(chosen);
+        }
+        return tok.Decode(ids);
+    }
+
+    // ── SERIALIZATION ──────────────────────────────────────────────────
+    public void Save(string dir)
+    {
+        Directory.CreateDirectory(dir);
+        SaveTensor(_tokenEmb, Path.Combine(dir, "token_emb.bin"));
+        SaveTensor(_lmHead, Path.Combine(dir, "lm_head.bin"));
+        for (int l = 0; l < NLayers; l++) SaveBlock(_blocks[l], dir, l);
+        var cfg = new { DModel, NHeads, NLayers, DFF, VocabSize, MaxSeq };
+        File.WriteAllText(Path.Combine(dir, "config.json"), JsonSerializer.Serialize(cfg));
+    }
+
+    public static TransformerLM Load(string dir)
+    {
+        var cfg = JsonSerializer.Deserialize<Dictionary<string, int>>(File.ReadAllText(Path.Combine(dir, "config.json")))!;
+        var m = new TransformerLM(cfg["VocabSize"], cfg["DModel"], cfg["NHeads"], cfg["NLayers"], cfg["DFF"], cfg["MaxSeq"]);
+        LoadTensor(m._tokenEmb, Path.Combine(dir, "token_emb.bin"));
+        LoadTensor(m._lmHead, Path.Combine(dir, "lm_head.bin"));
+        for (int l = 0; l < m.NLayers; l++) LoadBlock(m._blocks[l], dir, l);
+        return m;
+    }
+
+    static void SaveBlock(TransformerBlock b, string dir, int l)
+    {
+        string p = Path.Combine(dir, $"block{l}_");
+        SaveLinear(b.Attn.Wq, p + "attn_wq");
+        SaveLinear(b.Attn.Wk, p + "attn_wk");
+        SaveLinear(b.Attn.Wv, p + "attn_wv");
+        SaveLinear(b.Attn.Wo, p + "attn_wo");
+        SaveLinear(b.FFN.W1, p + "ffn_w1");
+        SaveLinear(b.FFN.W2, p + "ffn_w2");
+        SaveFloatArr(b.LN1.Gamma, p + "ln1_gamma.bin");
+        SaveFloatArr(b.LN1.Beta, p + "ln1_beta.bin");
+        SaveFloatArr(b.LN2.Gamma, p + "ln2_gamma.bin");
+        SaveFloatArr(b.LN2.Beta, p + "ln2_beta.bin");
+    }
+
+    static void LoadBlock(TransformerBlock b, string dir, int l)
+    {
+        string p = Path.Combine(dir, $"block{l}_");
+        LoadLinear(b.Attn.Wq, p + "attn_wq");
+        LoadLinear(b.Attn.Wk, p + "attn_wk");
+        LoadLinear(b.Attn.Wv, p + "attn_wv");
+        LoadLinear(b.Attn.Wo, p + "attn_wo");
+        LoadLinear(b.FFN.W1, p + "ffn_w1");
+        LoadLinear(b.FFN.W2, p + "ffn_w2");
+        LoadFloatArr(b.LN1.Gamma, p + "ln1_gamma.bin");
+        LoadFloatArr(b.LN1.Beta, p + "ln1_beta.bin");
+        LoadFloatArr(b.LN2.Gamma, p + "ln2_gamma.bin");
+        LoadFloatArr(b.LN2.Beta, p + "ln2_beta.bin");
+    }
+
+    static void SaveLinear(Linear lin, string prefix)
+    {
+        SaveTensor(lin.W, prefix + "_W.bin");
+        SaveTensor(lin.B, prefix + "_B.bin");
+    }
+    static void LoadLinear(Linear lin, string prefix)
+    {
+        LoadTensor(lin.W, prefix + "_W.bin");
+        LoadTensor(lin.B, prefix + "_B.bin");
+    }
+    static void SaveTensor(Tensor t, string path)
+    {
+        using var fs = new BinaryWriter(File.Open(path, FileMode.Create));
+        fs.Write(t.Rows); fs.Write(t.Cols);
+        foreach (float f in t.Data) fs.Write(f);
+    }
+    static void LoadTensor(Tensor t, string path)
+    {
+        using var fs = new BinaryReader(File.Open(path, FileMode.Open));
+        int r = fs.ReadInt32(), c = fs.ReadInt32();
+        for (int i = 0; i < t.Data.Length; i++) t.Data[i] = fs.ReadSingle();
+    }
+    static void SaveFloatArr(float[] a, string path)
+    {
+        using var fs = new BinaryWriter(File.Open(path, FileMode.Create));
+        foreach (float f in a) fs.Write(f);
+    }
+    static void LoadFloatArr(float[] a, string path)
+    {
+        using var fs = new BinaryReader(File.Open(path, FileMode.Open));
+        for (int i = 0; i < a.Length; i++) a[i] = fs.ReadSingle();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  ADAM OPTIMIZER  (with gradient clipping)
+// ─────────────────────────────────────────────────────────────────────────
+class AdamOptimizer
+{
+    float _lr, _b1, _b2, _eps, _clipNorm;
+    int _step;
+
+    // Moment buffers keyed by param id
+    Dictionary<string, (float[] m, float[] v)> _moments = new();
+
+    public AdamOptimizer(float lr = 3e-4f, float b1 = 0.9f, float b2 = 0.999f, float eps = 1e-8f, float clipNorm = 1f)
+    { _lr = lr; _b1 = b1; _b2 = b2; _eps = eps; _clipNorm = clipNorm; }
+
+    void UpdateParam(string key, float[] param, float[] grad)
+    {
+        if (!_moments.ContainsKey(key))
+            _moments[key] = (new float[param.Length], new float[param.Length]);
+        var (m, v) = _moments[key];
+        float bc1 = 1f - (float)Math.Pow(_b1, _step);
+        float bc2 = 1f - (float)Math.Pow(_b2, _step);
+        for (int i = 0; i < param.Length; i++)
+        {
+            m[i] = _b1 * m[i] + (1 - _b1) * grad[i];
+            v[i] = _b2 * v[i] + (1 - _b2) * grad[i] * grad[i];
+            float mh = m[i] / bc1;
+            float vh = v[i] / bc2;
+            param[i] -= _lr * mh / (MathF2.Sqrt(vh) + _eps);
+        }
+    }
+
+    void ClipGrads(TransformerLM model)
+    {
+        float norm = 0f;
+        void Acc(float[] g) { foreach (float x in g) norm += x * x; }
+        Acc(model._dTokenEmb.Data); Acc(model._dLmHead.Data);
+        foreach (var b in model._blocks)
+        {
+            void AccLin(Linear l) { Acc(l.DW.Data); Acc(l.DB.Data); }
+            AccLin(b.Attn.Wq); AccLin(b.Attn.Wk); AccLin(b.Attn.Wv); AccLin(b.Attn.Wo);
+            AccLin(b.FFN.W1); AccLin(b.FFN.W2);
+            Acc(b.LN1.DGamma); Acc(b.LN1.DBeta); Acc(b.LN2.DGamma); Acc(b.LN2.DBeta);
+        }
+        norm = MathF2.Sqrt(norm);
+        if (norm > _clipNorm)
+        {
+            float scale = _clipNorm / (norm + 1e-6f);
+            void Scale(float[] g) { for (int i = 0; i < g.Length; i++) g[i] *= scale; }
+            Scale(model._dTokenEmb.Data); Scale(model._dLmHead.Data);
+            foreach (var b in model._blocks)
+            {
+                void ScaleLin(Linear l) { Scale(l.DW.Data); Scale(l.DB.Data); }
+                ScaleLin(b.Attn.Wq); ScaleLin(b.Attn.Wk); ScaleLin(b.Attn.Wv); ScaleLin(b.Attn.Wo);
+                ScaleLin(b.FFN.W1); ScaleLin(b.FFN.W2);
+                Scale(b.LN1.DGamma); Scale(b.LN1.DBeta); Scale(b.LN2.DGamma); Scale(b.LN2.DBeta);
+            }
+        }
+    }
+
+    public void Step(TransformerLM model)
+    {
+        _step++;
+        ClipGrads(model);
+        UpdateParam("token_emb", model._tokenEmb.Data, model._dTokenEmb.Data);
+        UpdateParam("lm_head", model._lmHead.Data, model._dLmHead.Data);
+        int l = 0;
+        foreach (var b in model._blocks)
+        {
+            void UpdLin(Linear lin, string n) { UpdateParam(n + "_W", lin.W.Data, lin.DW.Data); UpdateParam(n + "_B", lin.B.Data, lin.DB.Data); }
+            UpdLin(b.Attn.Wq, $"b{l}_wq"); UpdLin(b.Attn.Wk, $"b{l}_wk"); UpdLin(b.Attn.Wv, $"b{l}_wv"); UpdLin(b.Attn.Wo, $"b{l}_wo");
+            UpdLin(b.FFN.W1, $"b{l}_w1"); UpdLin(b.FFN.W2, $"b{l}_w2");
+            UpdateParam($"b{l}_ln1g", b.LN1.Gamma, b.LN1.DGamma);
+            UpdateParam($"b{l}_ln1b", b.LN1.Beta, b.LN1.DBeta);
+            UpdateParam($"b{l}_ln2g", b.LN2.Gamma, b.LN2.DGamma);
+            UpdateParam($"b{l}_ln2b", b.LN2.Beta, b.LN2.DBeta);
+            l++;
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  CONSOLE UI
+// ─────────────────────────────────────────────────────────────────────────
+class Program
+{
+    const string ModelDir = "model_weights";
+    const string VocabFile = "vocab.json";
+    const string DefaultCorpus = "corpus.txt";
+
+    static TransformerLM? _model;
+    static Tokenizer _tok = new Tokenizer();
+    static AdamOptimizer _adam = new AdamOptimizer(lr: 3e-4f);
+
+    static void Main(string[] args)
+    {
+        Console.OutputEncoding = Encoding.UTF8;
+        Console.Title = "MiniTransformer AI";
+        PrintBanner();
+
+        // Try to load existing model
+        if (File.Exists(VocabFile) && Directory.Exists(ModelDir))
+        {
+            try
+            {
+                _tok.Load(VocabFile);
+                _model = TransformerLM.Load(ModelDir);
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[✓] Loaded model ({_model.NLayers}L × {_model.DModel}d, vocab={_model.VocabSize})");
+                Console.ResetColor();
+            }
+            catch { Console.WriteLine("[!] Could not load model — start fresh."); }
+        }
+
+        MainMenu();
+    }
+
+    static void PrintBanner()
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine(@"
+```
+
+-----
+
+(  *)(    (  __)/ )( (  _ / ***) / *\ (  _ / )( /  *)(  _ (  __)(  _   
+) *) ) D ( ) *) \ / / ) _ (_** /    \ )   /) __ (  )*/  ) **/ ) _)  )   /
+(**)*)(****/(****) _*/ (****/(****/_/_/(___)_)(*/ (**) (**)  (**__)(___)
+██████╗  ██████╗      █████╗ ██╗
+██╔════╝ ██╔══██╗    ██╔══██╗██║
+██║  ███╗██████╔╝    ███████║██║
+██║   ██║██╔═══╝     ██╔══██║██║
+╚██████╔╝██║         ██║  ██║██║
+╚═════╝ ╚═╝         ╚═╝  ╚═╝╚═╝
+Pure C# Transformer Language Model — CPU Only — No APIs
+“);
+Console.ResetColor();
+}
+
+```
+    static void MainMenu()
+    {
+        while (true)
+        {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine("\n══════════════════════════════════════");
+            Console.WriteLine("  MAIN MENU");
+            Console.WriteLine("══════════════════════════════════════");
+            Console.ResetColor();
+            Console.WriteLine("  [1] Train on corpus file");
+            Console.WriteLine("  [2] Train on typed text");
+            Console.WriteLine("  [3] Chat / Generate");
+            Console.WriteLine("  [4] Show model info");
+            Console.WriteLine("  [5] Create new model (custom size)");
+            Console.WriteLine("  [6] Save model");
+            Console.WriteLine("  [7] Exit");
+            Console.Write("\n> ");
+            var key = Console.ReadLine()?.Trim();
+            switch (key)
+            {
+                case "1": TrainFromFile(); break;
+                case "2": TrainFromInput(); break;
+                case "3": ChatMode(); break;
+                case "4": ShowInfo(); break;
+                case "5": CreateNewModel(); break;
+                case "6": SaveModel(); break;
+                case "7": return;
+            }
+        }
+    }
+
+    static void TrainCore(string corpus, int epochs = 10, int seqLen = 64, float lr = 3e-4f)
+    {
+        // Build vocab if model not yet created
+        if (_model == null || _tok.VocabSize <= 4)
+        {
+            Console.WriteLine("[*] Building vocabulary...");
+            _tok.BuildFromCorpus(corpus);
+            Console.WriteLine($"[*] Vocab size: {_tok.VocabSize}");
+            if (_model == null)
+            {
+                Console.Write("    Creating default model (4 layers, 128 dim)...");
+                _model = new TransformerLM(_tok.VocabSize, 128, 4, 4, 512, 256);
+                Console.WriteLine(" done.");
+            }
+            _adam = new AdamOptimizer(lr);
+        }
+        else
+        {
+            // Expand vocab if needed
+            foreach (char c in corpus.Distinct()) { string s = c.ToString(); if (!_tok.Vocab.ContainsKey(s)) Console.WriteLine($"[!] New char '{c}' not in vocab — will map to <UNK>"); }
+        }
+
+        var allIds = _tok.Encode(corpus);
+        int N = allIds.Count;
+        if (N < seqLen + 1) { Console.WriteLine("[!] Corpus too short."); return; }
+
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine($"\n[*] Training {epochs} epochs, seq={seqLen}, corpus tokens={N}");
+        Console.ResetColor();
+
+        var rng = new Random(1337);
+        for (int ep = 1; ep <= epochs; ep++)
+        {
+            float totalLoss = 0f; int batches = 0;
+            // Mini-batches (single sequences, random start)
+            int steps = Math.Max(1, N / seqLen);
+            for (int s = 0; s < steps; s++)
+            {
+                int start = rng.Next(0, N - seqLen - 1);
+                int[] inp = allIds.GetRange(start, seqLen).ToArray();
+                int[] tgt = allIds.GetRange(start + 1, seqLen).ToArray();
+                float loss = _model.TrainStep(inp, tgt, _adam);
+                totalLoss += loss; batches++;
+
+                if (s % 50 == 0)
+                {
+                    Console.Write($"\r  Epoch {ep}/{epochs}  Step {s}/{steps}  Loss: {totalLoss / batches:F4}   ");
+                }
+            }
+            float avgLoss = totalLoss / batches;
+            Console.ForegroundColor = avgLoss < 2f ? ConsoleColor.Green : ConsoleColor.White;
+            Console.WriteLine($"\r  Epoch {ep}/{epochs} — Loss: {avgLoss:F4}  Perplexity: {Math.Exp(avgLoss):F1}   ");
+            Console.ResetColor();
+        }
+        Console.WriteLine("[✓] Training complete!");
+    }
+
+    static void TrainFromFile()
+    {
+        Console.Write("Corpus file path (blank = corpus.txt): ");
+        string path = Console.ReadLine()?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(path)) path = DefaultCorpus;
+        if (!File.Exists(path)) { Console.WriteLine($"[!] File not found: {path}"); return; }
+        string corpus = File.ReadAllText(path);
+        Console.Write("Epochs [10]: "); int ep = int.TryParse(Console.ReadLine(), out int e) ? e : 10;
+        Console.Write("Sequence length [64]: "); int sl = int.TryParse(Console.ReadLine(), out int s) ? s : 64;
+        Console.Write("Learning rate [0.0003]: "); float lr = float.TryParse(Console.ReadLine(), out float f) ? f : 3e-4f;
+        TrainCore(corpus, ep, sl, lr);
+        SaveModel();
+    }
+
+    static void TrainFromInput()
+    {
+        Console.WriteLine("Type/paste your training text (type END on its own line to finish):");
+        var sb = new StringBuilder();
+        string? line;
+        while ((line = Console.ReadLine()) != "END") sb.AppendLine(line);
+        string corpus = sb.ToString();
+        if (corpus.Length < 20) { Console.WriteLine("[!] Too short."); return; }
+        Console.Write("Epochs [20]: "); int ep = int.TryParse(Console.ReadLine(), out int e) ? e : 20;
+        TrainCore(corpus, ep, 32, 3e-4f);
+        SaveModel();
+    }
+
+    static void ChatMode()
+    {
+        if (_model == null) { Console.WriteLine("[!] No model loaded. Train first."); return; }
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("\n═══ CHAT / GENERATE MODE ═══");
+        Console.WriteLine("Type a prompt. Commands: /temp <val>, /topk <val>, /len <val>, /quit");
+        Console.ResetColor();
+        float temp = 0.8f; int topK = 40; int maxNew = 200;
+        while (true)
+        {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.Write("\nYou: ");
+            Console.ResetColor();
+            string? input = Console.ReadLine();
+            if (input == null || input == "/quit") break;
+            if (input.StartsWith("/temp ")) { temp = float.Parse(input[6..]); Console.WriteLine($"  Temperature = {temp}"); continue; }
+            if (input.StartsWith("/topk ")) { topK = int.Parse(input[6..]); Console.WriteLine($"  Top-K = {topK}"); continue; }
+            if (input.StartsWith("/len ")) { maxNew = int.Parse(input[5..]); Console.WriteLine($"  Max new tokens = {maxNew}"); continue; }
+
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.Write("AI: ");
+            Console.ResetColor();
+            try
+            {
+                string result = _model.Generate(_tok, input, maxNew, temp, topK);
+                Console.WriteLine(result);
+            }
+            catch (Exception ex) { Console.WriteLine($"[Error] {ex.Message}"); }
+        }
+    }
+
+    static void ShowInfo()
+    {
+        if (_model == null) { Console.WriteLine("[!] No model loaded."); return; }
+        long paramCount = 0;
+        paramCount += _model.VocabSize * _model.DModel * 2; // emb + lm_head
+        foreach (var b in new int[_model.NLayers])
+        {
+            paramCount += 4 * (_model.DModel * _model.DModel + _model.DModel); // 4 linears in attn
+            paramCount += _model.DModel * _model.DFF + _model.DFF + _model.DFF * _model.DModel + _model.DModel; // FFN
+            paramCount += _model.DModel * 4; // 2x LayerNorm
+        }
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine($"\n  Model dimensions : {_model.DModel}");
+        Console.WriteLine($"  Attention heads  : {_model.NHeads}");
+        Console.WriteLine($"  Transformer layers: {_model.NLayers}");
+        Console.WriteLine($"  Feed-forward dim : {_model.DFF}");
+        Console.WriteLine($"  Vocab size       : {_model.VocabSize}");
+        Console.WriteLine($"  Max sequence     : {_model.MaxSeq}");
+        Console.WriteLine($"  ~Parameters      : {paramCount:N0}");
+        Console.ResetColor();
+    }
+
+    static void CreateNewModel()
+    {
+        Console.Write("Model dimensions (default 128, larger=smarter but slower): ");
+        int d = int.TryParse(Console.ReadLine(), out int dd) ? dd : 128;
+        Console.Write("Attention heads (must divide dModel, default 4): ");
+        int h = int.TryParse(Console.ReadLine(), out int hh) ? hh : 4;
+        Console.Write("Number of layers (default 4): ");
+        int l = int.TryParse(Console.ReadLine(), out int ll) ? ll : 4;
+        Console.Write("Feed-forward dim (default 512): ");
+        int ff = int.TryParse(Console.ReadLine(), out int fff) ? fff : 512;
+        Console.Write("Max sequence length (default 256): ");
+        int ms = int.TryParse(Console.ReadLine(), out int mss) ? mss : 256;
+
+        if (d % h != 0) { Console.WriteLine("[!] dModel must be divisible by nHeads."); return; }
+
+        if (_tok.VocabSize <= 4)
+        {
+            Console.WriteLine("[!] No vocab built yet. Train on a corpus first.");
+            return;
+        }
+        _model = new TransformerLM(_tok.VocabSize, d, h, l, ff, ms);
+        _adam = new AdamOptimizer();
+        Console.WriteLine($"[✓] New model created: {l} layers × {d} dim, vocab={_tok.VocabSize}");
+    }
+
+    static void SaveModel()
+    {
+        if (_model == null) { Console.WriteLine("[!] No model to save."); return; }
+        _model.Save(ModelDir);
+        _tok.Save(VocabFile);
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine($"[✓] Model saved to ./{ModelDir}/");
+        Console.ResetColor();
+    }
+}
+```
+
+}
